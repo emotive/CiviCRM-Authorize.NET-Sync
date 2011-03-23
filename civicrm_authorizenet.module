@@ -1,0 +1,160 @@
+<?php
+
+/**
+*
+ * Implmentation of hook menu
+ */
+function civicrm_authorizenet_menu() {
+	
+	$items['civicrm_authorizenet_sync'] = array(
+		'title' => 'Civi_Auth_Net Sync',
+		'access arguments' => array('access content'),
+		'page callback' => 'civicrm_authorizenet_sync',
+		// 'page arguments' => array('civicrm_authorizenet_config_form'),
+		'type' => MENU_CALLBACK,
+	);
+	
+	return $items;
+}
+
+function civicrm_authorizenet_sync() {
+	
+	// use the civicrm authentication stuff
+	if(module_exists('civicrm')) {
+		civicrm_initialize();
+		 CRM_Utils_System::authenticateScript( true );
+		 // module_load_include doesn't suffice
+		 require_once('anet_php_sdk/AuthorizeNet.php');
+		 
+		 // Look for an active default payment processor with the authorize.net
+		 // credentials. (We safely assume client only has 1 live AuthNet Account)
+		 require_once('CRM/Core/DAO/PaymentProcessor.php');
+		 $PaymentProcessor = new CRM_Core_DAO_PaymentProcessor();
+		 $table_name = $PaymentProcessor->getTableName();
+		 
+		 $query = sprintf("SELECT user_name, password FROM %s WHERE is_active = 1 AND is_test = 0 AND payment_processor_type = 'AuthNet' LIMIT 0, 1", $table_name);
+		 $PaymentProcessor->query($query);
+		 
+		 while($PaymentProcessor->fetch()) {
+			$payment['login'] = $PaymentProcessor->user_name;
+			$payment['key'] = $PaymentProcessor->password;
+		 }
+		 
+		 if($payment['login'] == '' || $payment['key'] == '') {
+			echo 'Please setup ONE live Authorize.NET payment processor account';
+			exit();
+		 }
+		 		
+		// going through the first x number of transactions
+		$limit = (isset($_REQUEST['count'])) ? $_REQUEST['count'] : 20;
+		
+		if(!is_numeric($limit)) {
+			echo 'The count parameter must be an integer';
+			exit();
+		}
+		
+		// use contribution API to grab the contributions
+		require_once('api/v2/Contribution.php');
+		
+		// get the record of last offset
+		$offset = variable_get('civicrm_authnet_sync_offset', 0);
+		
+		$params = array(
+			'contribution_status_id' => 1,
+			'sort' => 'civicrm_contribution.id',
+			'rowCount' => $limit,
+			'offset' => $offset,
+		);
+		
+		$result = civicrm_contribution_search( $params );
+		
+		if ( civicrm_error ( $result )) {
+			echo $result['error_message'];
+			exit();
+		} else {
+			if(empty($result)) {
+				echo 'no new record retrieved';
+				exit();
+			}
+			define("AUTHORIZENET_API_LOGIN_ID", $payment['login']);
+			define("AUTHORIZENET_TRANSACTION_KEY", $payment['key']);
+			define('AUTHORIZENET_SANDBOX', FALSE);
+			
+			// creating new request object
+			$request = new AuthorizeNetTD;
+			
+			$processed = 0;
+			$settledCount = 0;
+			$unsettledCount = 0;
+			$unsettledPos = array();
+			$otherCount = 0;
+			$errorCount = 0;
+			$last_pending_processed = null;
+			foreach($result as $contribution_id => $contribution) {
+				// let's request the information from AuthNet
+				if(isset($contribution['trxn_id']) &&  $contribution['trxn_id'] != '') {
+					$response = $request->getTransactionDetails($contribution['trxn_id']);
+					if($response->xml->messages->resultCode == 'Ok') {
+						// only update settled transactions
+						if($response->xml->transaction->transactionStatus == 'settledSuccessfully') {
+							// format our things a bit
+							// $receipt_timestamp = strtotime($response->xml->transaction->batch->settlementTimeLocal);
+							$receipt_date = substr($response->xml->transaction->batch->settlementTimeLocal, 0, 10) . ' ' . substr($response->xml->transaction->batch->settlementTimeLocal, 11, 8);
+							$authAmount = number_format($response->xml->transaction->authAmount, 2);
+							$settleAmount = number_format($response->xml->transaction->settleAmount, 2);
+							$fee = $authAmount - $settleAmount;
+							
+							$update_params = array(
+								'id' => $contribution_id,
+								'fee_amount' => $fee,
+								'net_amount' => $settleAmount,
+								'receipt_date' => $receipt_date,
+							);
+							
+							$update_result = civicrm_contribution_add($update_params);
+							echo 'Contribution: ' . $contribution_id . ' is processed... <br />';
+							
+							$settledCount += 1;
+						} elseif($response->xml->transaction->transactionStatus == 'capturedPendingSettlement') {
+							echo 'Contribution: ' . $contribution_id . ' is pending Settlement... <br />';
+							$unsettledPos[] = $processed;
+							$unsettledCount += 1;
+						} else {
+							echo 'Contribution: ' . $contribution_id . ' is ' . $response->xml->transaction->transactionStatus . '... <br />';
+							$otherCount += 1;
+						}
+					} else {
+						$errorCount += 1;
+						echo 'Error on Contribution: ' . $contribution_id . ':'; 
+						echo '(code) ' . $response->xml->messages->message->code;
+						echo '(message)' . $response->xml->messages->message->text . '<br />';
+					} 
+					$processed++;
+				}
+			}
+			// 2 count components we don't care
+			$dontcarecount = $otherCount + $errorCount;
+			
+			// if all records are settled
+			if($processed == ($settledCount + $dontcarecount)) {
+				$offset += $processed;
+			} elseif($processed == ($unsettledCount + $dontcarecount)) {
+				if(!empty($unsettledPos)) {
+					$offset += $unsettledPos[0];
+				}
+			} else {
+				// find the first position of the unsettledCount
+				if(!empty($unsettledPos)) {
+					$offset += $unsettledPos[0];
+				}
+			}
+			
+			variable_set('civicrm_authnet_sync_offset', $offset);
+			echo 'processing completed';
+			exit();
+		}
+	} else {
+		echo 'CiviCRM is not enabled';
+		exit();
+	}
+}
