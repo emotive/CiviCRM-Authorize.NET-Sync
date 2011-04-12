@@ -1,0 +1,299 @@
+<?php
+// $Id
+
+/**
+ * Implementation of hook_install().
+ */
+function civicrm_authorizenet_install() {
+	// Create tables.
+	drupal_install_schema('civicrm_authorizenet');
+}
+
+/**
+ * Implementation of hook_install().
+ */
+function civicrm_authorizenet_uninstall() {
+	// Remove tables
+	drupal_uninstall_schema('civicrm_authorizenet');
+  
+	// kill all the variables
+	variable_del('civicrm_authorizenet_batch_date');
+	variable_del('civicrm_authnet_sync_offset');
+}
+
+/**
+ * Implementation of hook_schema().
+ */
+function civicrm_authorizenet_schema() {
+
+	$schema['civicrm_authnet_batch'] = array(
+		'description' => t('Record AuthorizeNet Transaction Batch'),
+		'fields' => array(		
+			'batch_id' => array(
+				'type' => 'int',
+				'size' => 'big',
+				'not null' => TRUE,
+				'description' => t('primary key'),
+			),
+			'settlementtimeutc' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Settled in UTC'),
+			),		
+			'settlementtimelocal' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Settled in Local time'),
+			),
+			'settlementstate' => array(
+				'type' => 'varchar',
+				'not null' => TRUE,
+				'length' => 128,
+				'description' => t('State of the batch settlement'),
+			),
+			'paymentmethod' => array(
+				'type' => 'varchar',
+				'length' => 32,
+				'description' => t('Payment method'),
+			),
+			'status' => array(
+				'type' => 'int',
+				'size' => 'tiny',
+				'not null' => FALSE,
+				'default' => 0,
+				'description' => t('If processing for this batch is complete'),
+			),
+			'num_transaction' => array(
+				'type' => 'int',
+				'not null' => FALSE,
+				'default' => 0,
+				'description' => t('Number of transactions from this batch'),
+			),
+			'num_processed' => array(
+				'type' => 'int',
+				'not null' => FALSE,
+				'default' => 0,
+				'description' => t('Number of transactions synched from this batch'),				
+			),
+		),
+		'primary key' => array('batch_id'),
+	);
+	
+	$schema['civicrm_authnet_transaction'] = array(
+		'description' => t('Transaction details'),
+		'fields' => array(		
+			'id' => array(
+				'type' => 'serial',
+				'not null' => TRUE,
+				'description' => t('primary key'),
+			),
+			'transid' => array(
+				'type' => 'int',
+				'not null' => TRUE,
+				'size' => 'big',
+				'description' => t('Transaction ID'),
+			),	
+			'reftransid' => array(
+				'type' => 'int',
+				'not null' => FALSE,
+				'default' => null,
+				'description' => t('Referral transaction ID, useful for refund transactions'),
+				'size' => 'big',
+			),		
+			'invoicenumber' => array(
+				'type' => 'varchar',
+				'length' => 128,
+				'not null' => TRUE,
+				'description' => t('Invoice ID for the order'),
+			),
+			'order_description' => array(
+				'type' => 'varchar',
+				'not null' => FALSE,
+				'default' => null,
+				'length' => 255,
+				'description' => t('Order description'),
+			),
+			'resultcode' => array(
+				'type' => 'varchar',
+				'not null' => TRUE,
+				'length' => 16,
+				'description' => t('Message result code'),
+			),
+			'message_code' => array(
+				'type' => 'char',
+				'not null' => TRUE,
+				'length' => 6,
+				'description' => t('The message code, see documentation appendix'),
+			),
+			'message_text' => array(
+				'type' => 'varchar',
+				'not null' => TRUE,
+				'length' => 128,
+				'description' => t('Message text'),
+			),
+			'submittimeutc' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Submitted in UTC'),
+			),		
+			'submittimelocal' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Submitted in Local time'),
+			),
+			'settlementtimeutc' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Settled in UTC'),
+			),		
+			'settlementtimelocal' => array(
+				'type' => 'datetime',
+				'not null' => TRUE,
+				'description' => t('Date Settled in Local time'),
+			),
+			'settlementstate' => array(
+				'type' => 'varchar',
+				'length' => 128,
+				'description' => t('Settlement State'),
+			),
+			'transactiontype' => array(
+				'type' => 'varchar',
+				'length' => 255,
+				'description' => t('Transaction Type'),
+			),
+			'transactionstatus' => array(
+				'type' => 'varchar',
+				'length' => 128,
+				'description' => t('Transaction status'),
+				'not null' => TRUE,
+			),
+			'responsecode' => array(
+				'type' => 'int',
+				'not null' => TRUE,
+				'description' => t('Responsecode'),
+				'size' => 'tiny',
+			),
+			'responsereasoncode' => array(
+				'type' => 'int',
+				'not null' => TRUE,
+				'description' => t('Response reason code'),
+				'size' => 'tiny',
+			),
+			'responsereasondescription' => array(
+				'type' => 'varchar',
+				'not null' => TRUE,
+				'description' => t('Response code description'),
+				'length' => 255,
+			),
+			'authamount' => array(
+				'type' => 'float',
+				'not null' => FALSE,
+				'default' => 0.00,
+				'precision' => 8,
+				'scale' => 2,
+				'description' => t('Authorized amount'),
+			),
+			'settleamount' => array(
+				'type' => 'float',
+				'not null' => FALSE,
+				'default' => 0.00,
+				'precision' => 8,
+				'scale' => 2,
+				'description' => t('Settled amount'),
+			),
+			'cardnumber' => array(
+				'type' => 'char',
+				'not null' => FALSE,
+				'length' => 4,
+				'default' => 'XXXX',
+				'description' => t('Last 4 digit of the credit card number'),
+			),
+			'cardtype' => array(
+				'type' => 'varchar',
+				'not null' => FALSE,
+				'length' => 16,
+				'default' => NULL,
+				'description' => t('Credit card type'),
+			),			
+			'batch_id' => array(
+				'type' => 'int',
+				'not null' => TRUE,
+				'size' => 'big',
+				'description' => t('Foreign key to the batch id'),
+			),
+			'processed' => array(
+				'type' => 'int',
+				'not null' => TRUE,
+				'size' => 'tiny',
+				'default' => 0,
+				'not null' => FALSE,
+				'description' => t('Has this transaction been synched?'),
+			),			
+		),
+		'primary key' => array('id'),
+		'unique keys' => array(
+			'authnet_transaction_id' => array('transid'),
+		),
+	);
+	
+$schema['civicrm_authnet_log'] = array(
+		'description' => t('Record AuthorizeNet Transaction Batch'),
+		'fields' => array(		
+			'id' => array(
+				'type' => 'serial',
+				'not null' => TRUE,
+				'description' => t('primary key'),
+			),
+			'resultCode' => array(
+				'type' => 'varchar',
+				'length' => 16,
+				'not null' => FALSE,
+				'description' => t('Result code from the AuthNet API call'),
+			),		
+			'message_code' => array(
+				'type' => 'char',
+				'not null' => FALSE,
+				'length' => 6,
+				'description' => t('The message code'),
+			),
+			'message_text' => array(
+				'type' => 'varchar',
+				'not null' => FALSE,
+				'length' => 32,
+				'description' => t('Message text'),
+			),
+			'method' => array(
+				'type' => 'varchar',
+				'length' => 128,
+				'not null' => FALSE,
+				'description' => t('The function call that result in the log record'),
+			),
+			'type' => array(
+				'type' => 'varchar',
+				'length' => 64,
+				'not null' => FALSE,
+				'description' => t('Transaction, Batch, CiviCRM API call, etc'),
+			),
+			'source_id' => array(
+				'type' => 'varchar',
+				'not null' => FALSE,
+				'length' => 64,
+				'default' => 0,
+				'description' => t('The source id, i.e. trans_id, batch_id'),
+			),
+			'error_message' => array(
+				'type' => 'varchar',
+				'length' => 255,
+				'not null' => FALSE,
+				'description' => t('Optional human readable message'),				
+			),
+			'log_time' => array(
+				'type' => 'datetime',
+				'description' => t('Log date'),
+			),
+		),
+		'primary key' => array('id'),
+	);
+
+	return $schema;
+}

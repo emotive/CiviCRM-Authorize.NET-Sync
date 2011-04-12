@@ -26,7 +26,7 @@ This module requires the following:
 	
 	(CiviCRM/Drupal Requirement)
 	1. Drupal Version 6.x
-	2. CiviCRM < 3.4 (Versions with API V2)
+	2. CiviCRM < 3.4 (Versions with API V2) Or (Turn off API V3 on CiviCRM 3.4)
 	3. An active Authorize.NET payment processor (live and being used)
 
 /*************************************************************
@@ -46,7 +46,7 @@ This module requires the following:
 	
 	There is not configuration except that you need a live 
 	Authorize.NET payment processor and an API login and 
-	Transaction key
+	Transaction key set up in CiviCRM's backend
 
 /*************************************************************
  * 4. Usage
@@ -55,7 +55,7 @@ This module requires the following:
 	1. Set up the synchronization cron to run at your desired interval,
 	it should look like
 	
-	curl -d "name=[user]&pass=[pass]&key=[civicrm_site_key]&count=[x]" 
+	curl -d "name=[user]&pass=[pass]&key=[civicrm_site_key]" 
 	http://yoursite.com/civicrm_authorizenet_sync
 	
 	where
@@ -63,21 +63,36 @@ This module requires the following:
 	[user] = drupal user that can run civicrm cron such as CiviCRM mail cron
 	[pass] = password associated with that user
 	[civicrm_site_key] = can be found under sites/default/civicrm.settings.php
-	[x] = how many record you would like to process each cron run (defaults to 20)
 
-	The cron process will update the following field in the civicrm_contribution
+	The cron process will perform the following:
 	
+	If the transaction has been successfully settled (cleared), it will update the contribution record's:
 		fee_amount
 		net_amount
 		receipt_date
 
-	If a contribution record shows up as "unsettled" in Authorize.NET, the CRON will finish
-	running the current batch and next time it starts it will attempt to sync FROM that transaction
-	again.
-	
+	If the transaction has been voided, it will create a new contribution record with all the details of the original contribution and:
+		contribution_status_id: 3 (cancelled)
+		cancelled date
+		cancelled reason: original transaction id
+		total amount: negative amount of the original contribution
+		
+	If the transaction has been refunded, it will create a new contribution record with all the details of the original contribution and:
+		trxn_id: new transaction id
+		cancelled date: date the refund was issued
+		cancelled reason: original transaction id
+		total amount: amount refunded (might be different from original contribution because of partial refund.
+		contribution_status_id: 7 (Refunded)
 
 /*************************************************************
  * 6. Change log
  ************************************************************/
- 
+
+1.5 Total Code Rework 4/12/2011
+	Now can sync refuneded and voided transactions by creating new 
+	contribution records with negative amount.
+	New contribution status id 7 (Refunded) that can be used in 
+	Donor detail report.
+	Database logs.
+	
 1.0 Working Version: 3/23/2011

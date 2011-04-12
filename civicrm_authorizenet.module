@@ -1,7 +1,6 @@
 <?php
 
 /**
-*
  * Implmentation of hook menu
  */
 function civicrm_authorizenet_menu() {
@@ -10,22 +9,32 @@ function civicrm_authorizenet_menu() {
 		'title' => 'Civi_Auth_Net Sync',
 		'access arguments' => array('access content'),
 		'page callback' => 'civicrm_authorizenet_sync',
-		// 'page arguments' => array('civicrm_authorizenet_config_form'),
 		'type' => MENU_CALLBACK,
 	);
-	
+		
 	return $items;
 }
 
+/*
+ ***************************************
+ * Main runtime function call
+ *
+ * Processing logic
+ * 1. Fetch all settled batch in a 10 days period
+ * 2. Fetch all associated transactions from a single batch
+ * 3. Synchronize civicrm_contribution with the transactions
+ */
 function civicrm_authorizenet_sync() {
 	
-	// use the civicrm authentication stuff
-	if(module_exists('civicrm')) {
+	$flag = TRUE;
+	if(!module_exists('civicrm')) {
+		$flag = FALSE;
+	}
+	
+	if($flag) {
 		civicrm_initialize();
-		 CRM_Utils_System::authenticateScript( true );
-		 // module_load_include doesn't suffice
-		 require_once('anet_php_sdk/AuthorizeNet.php');
-		 
+		CRM_Utils_System::authenticateScript( true );
+		
 		 // Look for an active default payment processor with the authorize.net
 		 // credentials. (We safely assume client only has 1 live AuthNet Account)
 		 require_once('CRM/Core/DAO/PaymentProcessor.php');
@@ -44,117 +53,350 @@ function civicrm_authorizenet_sync() {
 			echo 'Please setup ONE live Authorize.NET payment processor account';
 			exit();
 		 }
-		 		
-		// going through the first x number of transactions
-		$limit = (isset($_REQUEST['count'])) ? $_REQUEST['count'] : 20;
 		
-		if(!is_numeric($limit)) {
-			echo 'The count parameter must be an integer';
-			exit();
+		require_once('anet_php_sdk/AuthorizeNet.php');
+		define("AUTHORIZENET_API_LOGIN_ID", $payment['login']);
+		define("AUTHORIZENET_TRANSACTION_KEY", $payment['key']);
+		define('AUTHORIZENET_SANDBOX', FALSE);
+		 
+		 $request = new AuthorizeNetTD;
+		
+		// fetch any new settled batch of transactions
+		_civicrm_authorizenet_get_batch($request);
+		
+		// fetch 1 batch of transactions from the settled batches
+		_civicrm_authorizenet_get_transactions_from_batch($request);
+		
+		// sync the transactions from the AuthNet transactions to
+		// civicrm contributions
+		_civicrm_authorizenet_sync();
+	}
+	echo 'done';
+	exit();
+}
+
+
+/*
+ * Sync transactions between authorizenet to Civi financials
+ */
+function _civicrm_authorizenet_sync($count = 10) {
+	
+	// civicrm_initialize();
+	require_once('api/v2/Contribution.php');
+	
+	$query = db_query(
+		"SELECT * FROM {civicrm_authnet_transaction}
+		WHERE message_code = 'I00001'
+		AND resultCode = 'Ok'
+		AND processed = 0
+		ORDER BY id
+		LIMIT 0, %d",
+		$count
+	);
+	
+	// process 10 rows of transactions
+	while($transaction = db_fetch_array($query)) {
+		// handling refund transaction
+		if($transaction['reftransid'] != 0) {
+			$params = array('trxn_id' => $transaction['reftransid']);
+		} else {
+			$params = array('trxn_id' => $transaction['transid']);
 		}
-		
-		// use contribution API to grab the contributions
+		$contribution = civicrm_contribution_get($params);
+		if(civicrm_error($contribution)) {
+			// log, although it might be that just no matching contribution to that transaction
+			_civicrm_authorizenet_sync_log(null, array('error_message' => $contribution['error_message'], 'type' => 'CiviCRM', 'source_id' => $transaction['transid']), '_civicrm_authorizenet_sync');
+		} else {
+			$update_params = array();
+			switch($transaction['transactionstatus']) {
+				case 'settledSuccessfully':
+					$fee = $transaction['authamount'] - $transaction['settleamount'];
+					$update_params = array(
+						'id' => $contribution['contribution_id'],
+						'fee_amount' => $fee,
+						'net_amount' => $transaction['settleamount'],
+						'receipt_date' => $transaction['settlementtimelocal'],
+					);						
+				break;
+				case 'voided':
+					$update_params = $contribution;
+					unset($update_params['contribution_id']);
+					$update_params['total_amount'] = 0 - $contribution['total_amount'];
+					$update_params['net_amount'] = null;
+					$update_params['fee_amount'] = null;
+					$update_params['trxn_id'] = $contribution['trxn_id'] . '|r';
+					$update_params['contribution_status_id'] = 3;
+					$update_params['cancel_date'] = $transaction['settlementtimelocal'];
+					$update_params['cancel_reason'] = $contribution['trxn_id'];
+					$update_params['invoice_id'] = $contribution['invoice_id'] . '|r';						
+				break;
+				case 'refundSettledSuccessfully':
+					// check to see if we have a contribution status of 'Refunded'
+					_civicrm_authorizenet_refund_status();
+					$update_params = $contribution;
+					unset($update_params['contribution_id']);
+					// it may be a partial refund
+					$update_params['total_amount'] = 0 - $transaction['settleamount'];
+					$update_params['net_amount'] = null;
+					$update_params['fee_amount'] = null;
+					$update_params['cancel_date'] = $transaction['settlementtimelocal'];
+					$update_params['cancel_reason'] = $contribution['trxn_id'];
+					// refund should give a new transaction id
+					$update_params['trxn_id'] = $transaction['transid'];
+					// invoice number still the same but civi does not allow it
+					$update_params['invoice_id'] = $contribution['invoice_id'] . '|r';
+					$update_params['contribution_status_id'] = 7;									
+				break;
+				default:
+					// log other type of transaction to see if there are anything interesting?
+				break;
+			}
+			// don't care about other type of transactions (right now)
+			if(!empty($update_params)) {
+				$result = civicrm_contribution_add($update_params);
+				if(civicrm_error($result)) {
+					// log
+					_civicrm_authorizenet_sync_log(null, array('error_message' => $result['error_message'], 'type' => 'CiviCRM',), '_civicrm_authorizenet_sync');
+				}
+			}
+		}
+		// mark the record as updated
+		db_query("UPDATE {civicrm_authnet_transaction} SET processed = 1 WHERE id = %d", $transaction['id']);
+	}
+}
+
+/*
+ **************************************
+ * Retrieve settled batch information 
+ * from authorize.NET in a 10 day interval
+ */
+function _civicrm_authorizenet_get_batch($AuthorizeNetTD) {
+	
+	$last_process_date = variable_get('civicrm_authorizenet_batch_date', array());
+	
+	// retrieving the first start date to look at if it is the first time we are processing and fetching batches
+	if(empty($last_process_date)) {
+		// if we are using this the first time
 		require_once('api/v2/Contribution.php');
-		
-		// get the record of last offset
-		$offset = variable_get('civicrm_authnet_sync_offset', 0);
-		
 		$params = array(
 			'contribution_status_id' => 1,
-			'sort' => 'civicrm_contribution.id',
-			'rowCount' => $limit,
-			'offset' => $offset,
+			'sort' => 'civicrm_contribution.receive_date',
+			'rowCount' => 1,
+			'offset' => 0,
 		);
-		
-		$result = civicrm_contribution_search( $params );
-		
+		$result = civicrm_contribution_search( $params );	
 		if ( civicrm_error ( $result )) {
+			
+			// log
+			_civicrm_authorizenet_sync_log(null, array('type' => 'CiviCRM', 'error_message' => $result['error_message']), '_civicrm_authorizenet_get_batch');
 			echo $result['error_message'];
 			exit();
-		} else {
-			if(empty($result)) {
-				echo 'no new record retrieved';
-				exit();
-			}
-			define("AUTHORIZENET_API_LOGIN_ID", $payment['login']);
-			define("AUTHORIZENET_TRANSACTION_KEY", $payment['key']);
-			define('AUTHORIZENET_SANDBOX', FALSE);
-			
-			// creating new request object
-			$request = new AuthorizeNetTD;
-			
-			$processed = 0;
-			$settledCount = 0;
-			$unsettledCount = 0;
-			$unsettledPos = array();
-			$otherCount = 0;
-			$errorCount = 0;
-			$last_pending_processed = null;
-			foreach($result as $contribution_id => $contribution) {
-				// let's request the information from AuthNet
-				if(isset($contribution['trxn_id']) &&  $contribution['trxn_id'] != '') {
-					$response = $request->getTransactionDetails($contribution['trxn_id']);
-					if($response->xml->messages->resultCode == 'Ok') {
-						// only update settled transactions
-						if($response->xml->transaction->transactionStatus == 'settledSuccessfully') {
-							// format our things a bit
-							// $receipt_timestamp = strtotime($response->xml->transaction->batch->settlementTimeLocal);
-							$receipt_date = substr($response->xml->transaction->batch->settlementTimeLocal, 0, 10) . ' ' . substr($response->xml->transaction->batch->settlementTimeLocal, 11, 8);
-							$authAmount = number_format($response->xml->transaction->authAmount, 2);
-							$settleAmount = number_format($response->xml->transaction->settleAmount, 2);
-							$fee = $authAmount - $settleAmount;
-							
-							$update_params = array(
-								'id' => $contribution_id,
-								'fee_amount' => $fee,
-								'net_amount' => $settleAmount,
-								'receipt_date' => $receipt_date,
-							);
-							
-							$update_result = civicrm_contribution_add($update_params);
-							echo 'Contribution: ' . $contribution_id . ' is processed... <br />';
-							
-							$settledCount += 1;
-						} elseif($response->xml->transaction->transactionStatus == 'capturedPendingSettlement') {
-							echo 'Contribution: ' . $contribution_id . ' is pending Settlement... <br />';
-							$unsettledPos[] = $processed;
-							$unsettledCount += 1;
-						} else {
-							echo 'Contribution: ' . $contribution_id . ' is ' . $response->xml->transaction->transactionStatus . '... <br />';
-							$otherCount += 1;
-						}
-					} else {
-						$errorCount += 1;
-						echo 'Error on Contribution: ' . $contribution_id . ':'; 
-						echo '(code) ' . $response->xml->messages->message->code;
-						echo '(message)' . $response->xml->messages->message->text . '<br />';
-					} 
-					$processed++;
-				}
-			}
-			// 2 count components we don't care
-			$dontcarecount = $otherCount + $errorCount;
-			
-			// if all records are settled
-			if($processed == ($settledCount + $dontcarecount)) {
-				$offset += $processed;
-			} elseif($processed == ($unsettledCount + $dontcarecount)) {
-				if(!empty($unsettledPos)) {
-					$offset += $unsettledPos[0];
-				}
-			} else {
-				// find the first position of the unsettledCount
-				if(!empty($unsettledPos)) {
-					$offset += $unsettledPos[0];
-				}
-			}
-			
-			variable_set('civicrm_authnet_sync_offset', $offset);
-			echo 'processing completed';
+		}
+		if(empty($result)) {
+			echo 'No contribution found, no need to perform additional processing';
 			exit();
 		}
+		foreach($result as $contribution) {
+			$start_date = $contribution['receive_date'];
+		}
 	} else {
-		echo 'CiviCRM is not enabled';
-		exit();
+			$start_date = $last_process_date['start_date'];
+	}
+	
+	// Run the authorize.net API to get the list of batch
+	$_start_date = db_result(db_query("SELECT DATE_FORMAT('%s', '%%Y-%%m-%%dT%%k:%%i:%%s')", $start_date));
+	$_end_date = db_result(db_query("SELECT DATE_FORMAT(DATE_ADD('%s', INTERVAL 10 DAY), '%%Y-%%m-%%dT%%k:%%i:%%s')", $start_date));
+		
+	$response = $AuthorizeNetTD->GetSettledBatchList(FALSE,$_start_date, $_end_date);
+	if($response->xml->messages->message->code == 'I00004') {
+		// empty, no batch record found for the given date range
+		variable_set('civicrm_authorizenet_batch_date', array('start_date' => $_start_date, 'last_processed' => time()));
+		return;
+	} elseif($response->xml->messages->message->code == 'I00001') {
+		foreach($response->xml->batchList->batch as $batch) {
+			db_query("INSERT INTO {civicrm_authnet_batch} (`batch_id`, `settlementtimeutc`, `settlementtimelocal`, `settlementstate`, `paymentmethod`)
+			VALUES (%d, '%s', '%s', '%s', '%s') ON DUPLICATE KEY UPDATE `batch_id` = %d",
+			$batch->batchId,
+			$batch->settlementTimeUTC,
+			$batch->settlementTimeLocal,
+			$batch->settlementState,
+			$batch->paymentMethod,
+			$batch->batchId);
+			
+			// logging
+			_civicrm_authorizenet_sync_log($response->xml->messages, array('type' => 'batch', 'source_id' => $batch->batchId), '_civicrm_authorizenet_get_batch');
+		}
+		// save our progress
+		variable_set('civicrm_authorizenet_batch_date', array('start_date' => $_end_date, 'last_processed' => time()));
+		return;
+	}	
+	else {
+		_civicrm_authorizenet_sync_log($response->xml->messages, array('type' => 'batch'), '_civicrm_authorizenet_get_batch');
+		return;
+	}
+}
+
+/*
+ *******************************************
+ * Retrieve transactions from a given batch
+ */
+function _civicrm_authorizenet_get_transactions_from_batch($AuthorizeNetTD) {
+	
+	$batch_id = db_result(db_query("SELECT batch_id FROM {civicrm_authnet_batch} 
+					WHERE settlementstate = 'settledSuccessfully' 
+					AND status = 0 
+					ORDER BY settlementtimeutc
+					LIMIT 0, 1"));
+	
+	$processed = 0;
+	if(isset($batch_id) && $batch_id != '') {
+		$response = $AuthorizeNetTD->getTransactionList($batch_id);
+		if($response->xml->messages->message->code == 'I00001') {
+			$batch_count = count($response->xml->transactions->transaction);
+			foreach($response->xml->transactions->transaction as $transaction) {
+				// process each transaction
+				$processed += _civicrm_authorizenet_get_transaction($transaction->transId, $AuthorizeNetTD);
+			}
+			// update the batch status
+			// 1. All transaction from the batch are processed
+			if($processed === $batch_count) {
+				$status = 1;
+				
+			} elseif($processed <= $batch_count) {
+				// completed but not all transaction recorded
+				$status = 2;
+			} else {
+				// unknown, processed cannot exceed batch count
+				$status = 99;
+			}
+			db_query("UPDATE {civicrm_authnet_batch} SET num_transaction = %d, num_processed = %d, status = %d WHERE batch_id = %d", $batch_count, $processed, $status, $batch_id);
+		} else {
+			// error or no transaction record found for this batch 
+			// means invalid batch id because we only fetched settled batches
+			_civicrm_authorizenet_sync_log($response->xml->messages, array('type' => 'batch', 'source_id' => $batch_id,), '_civicrm_authorizenet_get_transactions_from_batch');
+		}
+	} else {
+		// No batch fetched that hasn't been processed
+		return;
+	}
+}
+
+
+/*
+ *******************************************
+ * Inserting a single record of transaction
+ */
+function _civicrm_authorizenet_get_transaction($transaction_id, $AuthorizeNetTD) {
+	// assuming valid transaction id passed in
+	$response = $AuthorizeNetTD->GetTransactionDetails($transaction_id);
+	if($response->xml->messages->message->code == 'I00001') {
+		$query = db_query("INSERT INTO {civicrm_authnet_transaction} 
+		(	`transid`,
+			`reftransid`, 
+			`invoicenumber`,
+			`order_description`,
+			`resultcode`,
+			`message_code`,
+			`message_text`,
+			`submittimeutc`,
+			`submittimelocal`,
+			`settlementtimeutc`,
+			`settlementtimelocal`,
+			`settlementstate`,
+			`transactiontype`,
+			`transactionstatus`,
+			`responsecode`,
+			`responsereasoncode`,
+			`responsereasondescription`,
+			`authamount`,
+			`settleamount`,
+			`cardnumber`,
+			`cardtype`,
+			`batch_id` ) VALUES (%d,%d,'%s','%s','%s','%s','%s','%s','%s','%s', '%s','%s','%s','%s','%s','%s','%s','%f','%f','%s','%s',%d)",
+		$response->xml->transaction->transId,
+		(isset($response->xml->transaction->refTransId)) ? $response->xml->transaction->refTransId : 0,
+		$response->xml->transaction->order->invoiceNumber,
+		$response->xml->transaction->order->description,
+		$response->xml->messages->resultCode,
+		$response->xml->messages->message->code,
+		$response->xml->messages->message->text,
+		$response->xml->transaction->submitTimeUTC,
+		$response->xml->transaction->submitTimeLocal,
+		$response->xml->transaction->batch->settlementTimeUTC,
+		$response->xml->transaction->batch->settlementTimeLocal,
+		$response->xml->transaction->batch->settlementState,
+		$response->xml->transaction->transactionType,
+		$response->xml->transaction->transactionStatus,
+		$response->xml->transaction->responseCode,
+		$response->xml->transaction->responseReasonCode,
+		$response->xml->transaction->responseReasonDescription,
+		$response->xml->transaction->authAmount,
+		$response->xml->transaction->settleAmount,
+		substr($response->xml->transaction->payment->creditCard->cardNumber, 4),
+		$response->xml->transaction->payment->creditCard->cardType,
+		$response->xml->transaction->batch->batchId
+		);
+		
+		if(!$query) {
+			$code = 0;
+		} else {
+			$code = 1;
+		}
+	} else {
+		$code = 0;
+	}
+	
+	_civicrm_authorizenet_sync_log($response->xml->messages, array('type' => 'transaction', 'source_id' => $transaction_id,), '_civicrm_authorizenet_get_transaction');
+	return $code;
+}
+
+/*
+ ************************
+ * Write a log entry
+ */
+function _civicrm_authorizenet_sync_log($log_object, $data = array(), $method = 'unknown') {
+	if(is_a($log_object, 'SimpleXMLElement')) {
+		@db_query("INSERT INTO {civicrm_authnet_log} (`resultCode`, `message_code`, `message_text`, `method`, `type`, `source_id`, `log_time`)
+		VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+			$log_object->resultCode,
+			$log_object->message->code,
+			$log_object->message->text,
+			$method,
+			$data['type'],
+			(array_key_exists('source_id', $data)) ? $data['source_id'] : 0,
+			date('Y-m-d H:i:s')
+		);
+	} else {
+		@db_query("INSERT INTO {civicrm_authnet_log} (`method`, `type`, `source_id`, `error_message`, `log_time`)
+		VALUES ('%s', '%s', '%s', '%s', '%s')",
+		$method,
+		$data['type'],
+		(array_key_exists('source_id', $data)) ? $data['source_id'] : 0,
+		$data['error_message'],
+		date('Y-m-d H:i:s')
+		);
+	}
+}
+
+/*
+ * Create a new contribution status
+ */
+function _civicrm_authorizenet_refund_status() {
+	civicrm_initialize();
+	require_once('CRM/Core/BAO/OptionValue.php');
+	$param = array(
+		'option_group_id' => 11,
+		'name' => 'Refunded',
+	);
+	$result = CRM_Core_BAO_OptionValue::retrieve($param, $defaults);
+	if(!isset($result)) {
+		$params = array(
+			'option_group_id' => 11,
+			'name' => 'Refunded',
+			'label' => 'Refunded',
+			'value' => 7,
+			'weight' => 7,
+		);
+		CRM_Core_BAO_OptionValue::add($params, $ids);
 	}
 }
