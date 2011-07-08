@@ -176,41 +176,50 @@ function _civicrm_authorizenet_get_batch($AuthorizeNetTD) {
 	
 	// retrieving the first start date to look at if it is the first time we are processing and fetching batches
 	if(empty($last_process_date)) {
-		// if we are using this the first time
-		require_once('api/v2/Contribution.php');
-		$params = array(
-			'contribution_status_id' => 1,
-			'sort' => 'civicrm_contribution.receive_date',
-			'rowCount' => 1,
-			'offset' => 0,
-		);
-		$result = civicrm_contribution_search( $params );	
-		if ( civicrm_error ( $result )) {
-			
-			// log
-			_civicrm_authorizenet_sync_log(null, array('type' => 'CiviCRM', 'error_message' => $result['error_message']), '_civicrm_authorizenet_get_batch');
-			echo $result['error_message'];
+		$first_receive_date = CRM_Core_DAO::singleValueQuery("SELECT receive_date FROM civicrm_contribution WHERE receive_date IS NOT NULL and trxn_id IS NOT NULL ORDER BY receive_date"); 
+		
+		if(isset($first_receive_date) && $first_receive_date != NULL) {
+			$start_date = $first_receive_date;
+		} else {
+			// log, no contribution found with a receiving date, they are either imported
+			// contributions or just not good data
+			echo 'No record found with receiving date, exiting... <br />';
+			_civicrm_authorizenet_sync_log(null, array('type' => 'CiviCRM', 'error_message' => 'No contribution found with receive date'), '_civicrm_authorizenet_get_batch');
 			exit();
-		}
-		if(empty($result)) {
-			echo 'No contribution found, no need to perform additional processing';
-			exit();
-		}
-		foreach($result as $contribution) {
-			$start_date = $contribution['receive_date'];
 		}
 	} else {
 			$start_date = $last_process_date['start_date'];
 	}
 	
 	// Run the authorize.net API to get the list of batch
-	$_start_date = db_result(db_query("SELECT DATE_FORMAT('%s', '%%Y-%%m-%%dT%%k:%%i:%%s')", $start_date));
-	$_end_date = db_result(db_query("SELECT DATE_FORMAT(DATE_ADD('%s', INTERVAL 10 DAY), '%%Y-%%m-%%dT%%k:%%i:%%s')", $start_date));
+	$_start_date = db_result(db_query("SELECT DATE_FORMAT('%s', '%%Y-%%m-%%dT%%H:%%i:%%s')", $start_date));
+	$_end_date = db_result(db_query("SELECT DATE_FORMAT(DATE_ADD('%s', INTERVAL 10 DAY), '%%Y-%%m-%%dT%%H:%%i:%%s')", $start_date));
+	
+	// Check if the start date has passed current date
+	$date_diff = db_result(db_query("SELECT DATEDIFF(NOW(), '%s')", $_end_date));
+	if($date_diff <= 0) {
+		$_end_date = db_result(db_query("SELECT CURRENT_DATE()")) . 'T00:00:00';
+	}
+	
+	
+	// print_r($_start_date);
+	// print_r($_end_date);
+	// exit();
+	
 		
 	$response = $AuthorizeNetTD->GetSettledBatchList(FALSE,$_start_date, $_end_date);
 	if($response->xml->messages->message->code == 'I00004') {
 		// empty, no batch record found for the given date range
-		variable_set('civicrm_authorizenet_batch_date', array('start_date' => $_start_date, 'last_processed' => time()));
+		// we don't change the start date because we are assuming that no new batch has been settled
+		// we are up to date (current) so we don't want the pointer to go pass the current date interval
+		$date_diff = db_result(db_query("SELECT DATEDIFF(NOW(), '%s')", $_end_date));
+		// end date still in the past, we are safe to continue
+		if($date_diff > 0) {
+			variable_set('civicrm_authorizenet_batch_date', array('start_date' => $_end_date, 'last_processed' => time()));
+		} else {
+			variable_set('civicrm_authorizenet_batch_date', array('start_date' => $_start_date, 'last_processed' => time()));
+		}
+
 		return;
 	} elseif($response->xml->messages->message->code == 'I00001') {
 		foreach($response->xml->batchList->batch as $batch) {

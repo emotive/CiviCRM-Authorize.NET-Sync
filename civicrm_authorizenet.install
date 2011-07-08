@@ -259,7 +259,7 @@ $schema['civicrm_authnet_log'] = array(
 			'message_text' => array(
 				'type' => 'varchar',
 				'not null' => FALSE,
-				'length' => 32,
+				'length' => 255,
 				'description' => t('Message text'),
 			),
 			'method' => array(
