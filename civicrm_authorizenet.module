@@ -82,7 +82,7 @@ function civicrm_authorizenet_sync() {
 function _civicrm_authorizenet_sync($count = 10) {
 	
 	// civicrm_initialize();
-	require_once('api/v2/Contribution.php');
+	require_once('api/api.php');
 	
 	$query = db_query(
 		"SELECT * FROM {civicrm_authnet_transaction}
@@ -98,12 +98,13 @@ function _civicrm_authorizenet_sync($count = 10) {
 	while($transaction = db_fetch_array($query)) {
 		// handling refund transaction
 		if($transaction['reftransid'] != 0) {
-			$params = array('trxn_id' => $transaction['reftransid']);
+			$params = array('version' => '3', 'trxn_id' => $transaction['reftransid']);
 		} else {
-			$params = array('trxn_id' => $transaction['transid']);
+			$params = array('version' => '3', 'trxn_id' => $transaction['transid']);
 		}
-		$contribution = civicrm_contribution_get($params);
-		if(civicrm_error($contribution)) {
+		// CiviCRM API (V3)
+		$contribution = civicrm_api("Contribution", "get", $params);
+		if($contribution['is_error'] == 1) {
 			// log, although it might be that just no matching contribution to that transaction
 			_civicrm_authorizenet_sync_log(null, array('error_message' => $contribution['error_message'], 'type' => 'CiviCRM', 'source_id' => $transaction['transid']), '_civicrm_authorizenet_sync');
 		} else {
@@ -112,15 +113,17 @@ function _civicrm_authorizenet_sync($count = 10) {
 				case 'settledSuccessfully':
 					$fee = $transaction['authamount'] - $transaction['settleamount'];
 					$update_params = array(
-						'id' => $contribution['contribution_id'],
+						'version' => '3',
+						'id' => $contribution['id'],
 						'fee_amount' => $fee,
 						'net_amount' => $transaction['settleamount'],
 						'receipt_date' => $transaction['settlementtimelocal'],
 					);						
 				break;
 				case 'voided':
-					$update_params = $contribution;
-					unset($update_params['contribution_id']);
+					$update_params = $contribution['values'][$contribution['id']];
+					$update_params['version'] = '3';
+					// unset($update_params['contribution_id']);
 					$update_params['total_amount'] = 0 - $contribution['total_amount'];
 					$update_params['net_amount'] = null;
 					$update_params['fee_amount'] = null;
@@ -133,10 +136,11 @@ function _civicrm_authorizenet_sync($count = 10) {
 				case 'refundSettledSuccessfully':
 					// check to see if we have a contribution status of 'Refunded'
 					_civicrm_authorizenet_refund_status();
-					$update_params = $contribution;
-					unset($update_params['contribution_id']);
+					$update_params = $contribution['values'][$contribution['id']];
+					// unset($update_params['contribution_id']);
 					// it may be a partial refund
 					$update_params['total_amount'] = 0 - $transaction['settleamount'];
+					$update_params['version'] = '3';
 					$update_params['net_amount'] = null;
 					$update_params['fee_amount'] = null;
 					$update_params['cancel_date'] = $transaction['settlementtimelocal'];
@@ -153,8 +157,8 @@ function _civicrm_authorizenet_sync($count = 10) {
 			}
 			// don't care about other type of transactions (right now)
 			if(!empty($update_params)) {
-				$result = civicrm_contribution_add($update_params);
-				if(civicrm_error($result)) {
+				$result = civicrm_api('Contribution', 'create', $update_params);
+				if($result['is_error'] == 1) {
 					// log
 					_civicrm_authorizenet_sync_log(null, array('error_message' => $result['error_message'], 'type' => 'CiviCRM',), '_civicrm_authorizenet_sync');
 				}
